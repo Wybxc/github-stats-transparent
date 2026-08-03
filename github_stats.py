@@ -74,6 +74,8 @@ class Queries(object):
                             raise self._request_error(
                                 operation, status, request_id
                             )
+                        elif status == 204:
+                            return None
                         else:
                             try:
                                 result = await response.json(content_type=None)
@@ -582,9 +584,25 @@ Languages:
             result = await self.queries.query_rest(
                 f"/repos/{repo}/stats/contributors"
             )
+            if result is None:
+                commits = await self.queries.query_rest(
+                    f"/repos/{repo}/commits",
+                    params={"author": self.username, "per_page": 1},
+                )
+                if not isinstance(commits, list):
+                    raise GitHubAPIError(
+                        f"REST query returned malformed commit data for {repo}"
+                    )
+                if commits:
+                    raise GitHubAPIError(
+                        "Contributor statistics unavailable for "
+                        f"{repo} despite commits by {self.username}"
+                    )
+                continue
             if not isinstance(result, list):
                 raise GitHubAPIError(
-                    "REST query returned malformed contributor statistics"
+                    "REST query returned malformed contributor statistics "
+                    f"for {repo}"
                 )
             for author_obj in result:
                 # Handle malformed response from the API by skipping this repo

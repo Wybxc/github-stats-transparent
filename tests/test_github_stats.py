@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import generate_images
 from github_stats import GitHubAPIError, Queries, Stats
@@ -29,6 +29,14 @@ class FakeResponse:
 
     async def text(self):
         return self._text
+
+
+class NoContentResponse(FakeResponse):
+    def __init__(self):
+        super().__init__(204)
+
+    async def json(self, content_type=None):
+        raise AssertionError("204 responses must not be decoded as JSON")
 
 
 class QueueSession:
@@ -132,6 +140,18 @@ class PaginatedRepositorySession:
 
 
 class QueriesTest(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_204_returns_no_content_without_decoding_json(self):
+        session = QueueSession([NoContentResponse()])
+        queries = Queries(
+            "example", "token", session, stats_max_attempts=1
+        )
+
+        result = await queries.query_rest(
+            "/repos/example/repo/stats/contributors"
+        )
+
+        self.assertIsNone(result)
+
     async def test_retries_transient_non_json_response(self):
         session = QueueSession(
             [
@@ -181,6 +201,34 @@ class QueriesTest(unittest.IsolatedAsyncioTestCase):
 
 
 class StatsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_no_contributor_stats_is_zero_without_user_commits(self):
+        stats = Stats("example", "token", QueueSession([]))
+        stats._repos = {"example/repo"}
+        stats._ignored_repos = set()
+        stats.queries.query_rest = AsyncMock(side_effect=[None, []])
+
+        self.assertEqual((0, 0), await stats.lines_changed)
+        stats.queries.query_rest.assert_has_awaits(
+            [
+                call("/repos/example/repo/stats/contributors"),
+                call(
+                    "/repos/example/repo/commits",
+                    params={"author": "example", "per_page": 1},
+                ),
+            ]
+        )
+
+    async def test_no_contributor_stats_fails_when_user_has_commits(self):
+        stats = Stats("example", "token", QueueSession([]))
+        stats._repos = {"example/repo"}
+        stats._ignored_repos = set()
+        stats.queries.query_rest = AsyncMock(
+            side_effect=[None, [{"sha": "commit"}]]
+        )
+
+        with self.assertRaisesRegex(GitHubAPIError, "example/repo"):
+            await stats.lines_changed
+
     async def test_concurrent_initial_reads_share_one_paginated_load(self):
         session = RepositorySession()
         stats = Stats("example", "token", session)
