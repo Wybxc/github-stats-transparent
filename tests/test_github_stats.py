@@ -205,9 +205,13 @@ class StatsTest(unittest.IsolatedAsyncioTestCase):
         stats = Stats("example", "token", QueueSession([]))
         stats._repos = {"example/repo"}
         stats._ignored_repos = set()
+        stats.queries.query = AsyncMock(
+            return_value={"data": {"repository": {"isEmpty": False}}}
+        )
         stats.queries.query_rest = AsyncMock(side_effect=[None, []])
 
         self.assertEqual((0, 0), await stats.lines_changed)
+        stats.queries.query.assert_awaited_once()
         stats.queries.query_rest.assert_has_awaits(
             [
                 call("/repos/example/repo/stats/contributors"),
@@ -218,10 +222,28 @@ class StatsTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+    async def test_no_contributor_stats_is_zero_for_empty_repo(self):
+        stats = Stats("example", "token", QueueSession([]))
+        stats._repos = {"example/empty"}
+        stats._ignored_repos = set()
+        stats.queries.query = AsyncMock(
+            return_value={"data": {"repository": {"isEmpty": True}}}
+        )
+        stats.queries.query_rest = AsyncMock(return_value=None)
+
+        self.assertEqual((0, 0), await stats.lines_changed)
+        stats.queries.query.assert_awaited_once()
+        stats.queries.query_rest.assert_awaited_once_with(
+            "/repos/example/empty/stats/contributors"
+        )
+
     async def test_no_contributor_stats_fails_when_user_has_commits(self):
         stats = Stats("example", "token", QueueSession([]))
         stats._repos = {"example/repo"}
         stats._ignored_repos = set()
+        stats.queries.query = AsyncMock(
+            return_value={"data": {"repository": {"isEmpty": False}}}
+        )
         stats.queries.query_rest = AsyncMock(
             side_effect=[None, [{"sha": "commit"}]]
         )

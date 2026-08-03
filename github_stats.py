@@ -257,6 +257,17 @@ class Queries(object):
 """
 
     @staticmethod
+    def repository_is_empty(name_with_owner: str) -> str:
+        """Return a query that checks whether a repository has any commits."""
+        owner, name = name_with_owner.split("/", 1)
+        return f"""{{
+  repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{
+    isEmpty
+  }}
+}}
+"""
+
+    @staticmethod
     def contrib_years() -> str:
         """
         :return: GraphQL query to get all years the user has been a contributor
@@ -585,6 +596,17 @@ Languages:
                 f"/repos/{repo}/stats/contributors"
             )
             if result is None:
+                repository = (await self.queries.query(
+                    Queries.repository_is_empty(repo)
+                )).get("data", {}).get("repository")
+                if (not isinstance(repository, dict)
+                        or not isinstance(repository.get("isEmpty"), bool)):
+                    raise GitHubAPIError(
+                        f"GraphQL query returned malformed state for {repo}"
+                    )
+                if repository["isEmpty"]:
+                    continue
+
                 commits = await self.queries.query_rest(
                     f"/repos/{repo}/commits",
                     params={"author": self.username, "per_page": 1},
