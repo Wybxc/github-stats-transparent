@@ -1,11 +1,15 @@
 #!/usr/bin/python3
 
 import asyncio
+import json
 import os
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
-import requests
+
+
+class GitHubAPIError(RuntimeError):
+    """Raised when GitHub cannot provide a complete, valid response."""
 
 
 ###############################################################################
@@ -19,11 +23,92 @@ class Queries(object):
     """
 
     def __init__(self, username: str, access_token: str,
-                 session: aiohttp.ClientSession, max_connections: int = 10):
+                 session: aiohttp.ClientSession, max_connections: int = 10,
+                 max_attempts: int = 4, retry_base: float = 1.0,
+                 stats_max_attempts: int = 60,
+                 stats_retry_delay: float = 2.0):
         self.username = username
         self.access_token = access_token
         self.session = session
         self.semaphore = asyncio.Semaphore(max_connections)
+        self.max_attempts = max(1, max_attempts)
+        self.retry_base = max(0, retry_base)
+        self.stats_max_attempts = max(1, stats_max_attempts)
+        self.stats_retry_delay = max(0, stats_retry_delay)
+
+    @staticmethod
+    def _request_error(operation: str, status: int,
+                       request_id: Optional[str] = None) -> GitHubAPIError:
+        request_suffix = (f" (GitHub request {request_id})"
+                          if request_id else "")
+        return GitHubAPIError(
+            f"{operation} failed with HTTP {status}{request_suffix}"
+        )
+
+    async def _request_json(
+            self, method: str, url: str, operation: str,
+            attempts: int, base_delay: float,
+            retry_statuses: Set[int],
+            validator: Optional[Callable[[Any], Optional[str]]] = None,
+            exponential_backoff: bool = True,
+            **kwargs: Any) -> Any:
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Accept": "application/vnd.github+json",
+        }
+        last_error = GitHubAPIError(f"{operation} failed")
+
+        for attempt in range(attempts):
+            try:
+                async with self.semaphore:
+                    async with self.session.request(
+                            method, url, headers=headers, **kwargs) as response:
+                        status = response.status
+                        request_id = response.headers.get("X-GitHub-Request-Id")
+
+                        if status in retry_statuses:
+                            last_error = self._request_error(
+                                operation, status, request_id
+                            )
+                        elif not 200 <= status < 300:
+                            raise self._request_error(
+                                operation, status, request_id
+                            )
+                        else:
+                            try:
+                                result = await response.json(content_type=None)
+                            except (ValueError, aiohttp.ClientError):
+                                last_error = GitHubAPIError(
+                                    f"{operation} returned invalid JSON"
+                                    + (f" (GitHub request {request_id})"
+                                       if request_id else "")
+                                )
+                            else:
+                                validation_error = (validator(result)
+                                                    if validator else None)
+                                if validation_error is None:
+                                    return result
+                                last_error = GitHubAPIError(
+                                    f"{operation} {validation_error}"
+                                    + (f" (GitHub request {request_id})"
+                                       if request_id else "")
+                                )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_error = GitHubAPIError(
+                    f"{operation} failed with {type(exc).__name__}"
+                )
+
+            if attempt + 1 == attempts:
+                raise last_error
+            delay = base_delay * (2 ** attempt if exponential_backoff else 1)
+            if exponential_backoff or attempt == 0 or (attempt + 1) % 10 == 0:
+                print(
+                    f"{last_error}; retrying {operation} after attempt "
+                    f"{attempt + 1} in {delay:.1f}s"
+                )
+            await asyncio.sleep(delay)
+
+        raise last_error
 
     async def query(self, generated_query: str) -> Dict:
         """
@@ -32,25 +117,28 @@ class Queries(object):
         :param generated_query: string query to be sent to the API
         :return: decoded GraphQL JSON output
         """
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-        }
-        try:
-            async with self.semaphore:
-                r = await self.session.post("https://api.github.com/graphql",
-                                            headers=headers,
-                                            json={"query": generated_query})
-            return await r.json()
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r = requests.post("https://api.github.com/graphql",
-                                  headers=headers,
-                                  json={"query": generated_query})
-                return r.json()
+        def validate(result: Any) -> Optional[str]:
+            if not isinstance(result, dict):
+                return "returned an unexpected payload"
+            if result.get("errors"):
+                return "returned GraphQL errors"
+            if not isinstance(result.get("data"), dict):
+                return "returned no data"
+            return None
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+        return await self._request_json(
+            "POST",
+            "https://api.github.com/graphql",
+            "GraphQL query",
+            self.max_attempts,
+            self.retry_base,
+            {408, 429, 500, 502, 503, 504},
+            validator=validate,
+            json={"query": generated_query},
+        )
+
+    async def query_rest(self, path: str,
+                         params: Optional[Dict] = None) -> Any:
         """
         Make a request to the REST API
         :param path: API path to query
@@ -58,48 +146,30 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
-            try:
-                async with self.semaphore:
-                    r = await self.session.get(f"https://api.github.com/{path}",
-                                               headers=headers,
-                                               params=tuple(params.items()))
-                if r.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
-                    continue
+        normalized_path = path.lstrip("/")
+        is_repository_stats = normalized_path.endswith("/stats/contributors")
+        attempts = (self.stats_max_attempts if is_repository_stats
+                    else self.max_attempts)
+        delay = (self.stats_retry_delay if is_repository_stats
+                 else self.retry_base)
+        retry_statuses = {408, 429, 500, 502, 503, 504}
+        if is_repository_stats:
+            retry_statuses.add(202)
 
-                result = await r.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r = requests.get(f"https://api.github.com/{path}",
-                                     headers=headers,
-                                     params=tuple(params.items()))
-                    if r.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r.status_code == 200:
-                        return r.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
-        return dict()
+        return await self._request_json(
+            "GET",
+            f"https://api.github.com/{normalized_path}",
+            ("repository contributor statistics" if is_repository_stats
+             else "REST query"),
+            attempts,
+            delay,
+            retry_statuses,
+            exponential_backoff=not is_repository_stats,
+            params=params or {},
+        )
 
     @staticmethod
-    def repos_overview(contrib_cursor: Optional[str] = None,
-                       owned_cursor: Optional[str] = None) -> str:
+    def owned_repos(cursor: Optional[str] = None) -> str:
         """
         :return: GraphQL query with overview of user repositories
         """
@@ -108,13 +178,13 @@ class Queries(object):
     login,
     name,
     repositories(
-        first: 100,
+        first: 10,
         orderBy: {{
             field: UPDATED_AT,
             direction: DESC
         }},
         isFork: false,
-        after: {"null" if owned_cursor is None else '"'+ owned_cursor +'"'}
+        after: {json.dumps(cursor)}
     ) {{
       pageInfo {{
         hasNextPage
@@ -122,9 +192,7 @@ class Queries(object):
       }}
       nodes {{
         nameWithOwner
-        stargazers {{
-          totalCount
-        }}
+        stargazerCount
         forkCount
         languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
           edges {{
@@ -137,8 +205,19 @@ class Queries(object):
         }}
       }}
     }}
+  }}
+}}
+"""
+
+    @staticmethod
+    def contributed_repos(cursor: Optional[str] = None) -> str:
+        """Return a paginated query for repositories the user contributed to."""
+        return f"""{{
+  viewer {{
+    login,
+    name,
     repositoriesContributedTo(
-        first: 100,
+        first: 10,
         includeUserRepositories: false,
         orderBy: {{
             field: UPDATED_AT,
@@ -150,7 +229,7 @@ class Queries(object):
             REPOSITORY,
             PULL_REQUEST_REVIEW
         ]
-        after: {"null" if contrib_cursor is None else '"'+ contrib_cursor +'"'}
+        after: {json.dumps(cursor)}
     ) {{
       pageInfo {{
         hasNextPage
@@ -158,9 +237,7 @@ class Queries(object):
       }}
       nodes {{
         nameWithOwner
-        stargazers {{
-          totalCount
-        }}
+        stargazerCount
         forkCount
         languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
           edges {{
@@ -246,8 +323,10 @@ class Stats(object):
         self._total_contributions = None
         self._languages = None
         self._repos = None
+        self._ignored_repos = None
         self._lines_changed = None
-        self._views = None        
+        self._views = None
+        self._stats_task = None
 
     async def to_str(self) -> str:
         """
@@ -270,92 +349,123 @@ Project page views: {await self.views:,}
 Languages:
   - {formatted_languages}"""
 
-    async def get_stats(self) -> None:
-        """
-        Get lots of summary statistics using one big query. Sets many attributes
-        """
-        self._stargazers = 0
-        self._forks = 0
-        self._languages = dict()
-        self._repos = set()
-        self._ignored_repos = set()
-        
-        next_owned = None
-        next_contrib = None
+    async def _repository_pages(
+            self, connection_name: str,
+            query_builder: Callable[[Optional[str]], str]
+    ) -> Tuple[List[Dict], str]:
+        repos = []
+        cursor = None
+        seen_cursors = set()
+        display_name = None
+
         while True:
-            raw_results = await self.queries.query(
-                Queries.repos_overview(owned_cursor=next_owned,
-                                       contrib_cursor=next_contrib)
-            )
-            raw_results = raw_results if raw_results is not None else {}
+            raw_results = await self.queries.query(query_builder(cursor))
+            viewer = raw_results.get("data", {}).get("viewer")
+            if not isinstance(viewer, dict):
+                raise GitHubAPIError(
+                    "GraphQL query returned incomplete viewer data"
+                )
 
-            self._name = (raw_results
-                          .get("data", {})
-                          .get("viewer", {})
-                          .get("name", None))
-            if self._name is None:
-                self._name = (raw_results
-                              .get("data", {})
-                              .get("viewer", {})
-                              .get("login", "No Name"))
+            if display_name is None:
+                display_name = viewer.get("name") or viewer.get("login")
+            connection = viewer.get(connection_name)
+            if not isinstance(connection, dict):
+                raise GitHubAPIError(
+                    "GraphQL query returned incomplete repository data"
+                )
+            nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if (not isinstance(nodes, list)
+                    or not isinstance(page_info, dict)
+                    or any(not isinstance(repo, dict) for repo in nodes)):
+                raise GitHubAPIError(
+                    "GraphQL query returned malformed repository data"
+                )
+            repos.extend(nodes)
 
-            contrib_repos = (raw_results
-                             .get("data", {})
-                             .get("viewer", {})
-                             .get("repositoriesContributedTo", {}))
-            owned_repos = (raw_results
-                           .get("data", {})
-                           .get("viewer", {})
-                           .get("repositories", {}))
-            
-            repos = owned_repos.get("nodes", [])
-            if self._consider_forked_repos:
-                repos += contrib_repos.get("nodes", [])
-            else:
-                for repo in contrib_repos.get("nodes", []):
-                    name = repo.get("nameWithOwner")
-                    if name in self._ignored_repos or name in self._exclude_repos:
-                        continue
-                    self._ignored_repos.add(name)
-
-            for repo in repos:
-                name = repo.get("nameWithOwner")
-                if name in self._repos or name in self._exclude_repos:
-                    continue
-                self._repos.add(name)
-                self._stargazers += repo.get("stargazers").get("totalCount", 0)
-                self._forks += repo.get("forkCount", 0)
-
-                for lang in repo.get("languages", {}).get("edges", []):
-                    name = lang.get("node", {}).get("name", "Other")
-                    languages = await self.languages
-                    if name in self._exclude_langs: continue
-                    if name in languages:
-                        languages[name]["size"] += lang.get("size", 0)
-                        languages[name]["occurrences"] += 1
-                    else:
-                        languages[name] = {
-                            "size": lang.get("size", 0),
-                            "occurrences": 1,
-                            "color": lang.get("node", {}).get("color")
-                        }
-
-            if owned_repos.get("pageInfo", {}).get("hasNextPage", False) or \
-                    contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
-                next_owned = (owned_repos
-                              .get("pageInfo", {})
-                              .get("endCursor", next_owned))
-                next_contrib = (contrib_repos
-                                .get("pageInfo", {})
-                                .get("endCursor", next_contrib))
-            else:
+            if not page_info.get("hasNextPage", False):
                 break
+            cursor = page_info.get("endCursor")
+            if not isinstance(cursor, str) or cursor in seen_cursors:
+                raise GitHubAPIError(
+                    "GraphQL repository pagination returned an invalid cursor"
+                )
+            seen_cursors.add(cursor)
+
+        return repos, display_name or "No Name"
+
+    async def _load_stats(self) -> None:
+        """Fetch complete repository data, then publish it to this instance."""
+        (owned_result, contributed_result) = await asyncio.gather(
+            self._repository_pages("repositories", Queries.owned_repos),
+            self._repository_pages(
+                "repositoriesContributedTo", Queries.contributed_repos
+            ),
+        )
+        owned_repos, owned_name = owned_result
+        contributed_repos, contributed_name = contributed_result
+
+        repos = set()
+        ignored_repos = set()
+        languages: Dict[str, Dict] = {}
+        stargazers = 0
+        forks = 0
+
+        selected_repos = list(owned_repos)
+        if self._consider_forked_repos:
+            selected_repos.extend(contributed_repos)
+
+        for repo in selected_repos:
+            repo_name = repo.get("nameWithOwner")
+            if repo_name in repos or repo_name in self._exclude_repos:
+                continue
+
+            repos.add(repo_name)
+            stargazers += repo.get("stargazerCount", 0)
+            forks += repo.get("forkCount", 0)
+
+            for language in repo.get("languages", {}).get("edges", []):
+                node = language.get("node", {})
+                language_name = node.get("name", "Other")
+                if language_name in self._exclude_langs:
+                    continue
+                if language_name not in languages:
+                    languages[language_name] = {
+                        "size": 0,
+                        "occurrences": 0,
+                        "color": node.get("color"),
+                    }
+                languages[language_name]["size"] += language.get("size", 0)
+                languages[language_name]["occurrences"] += 1
+
+        if not self._consider_forked_repos:
+            for repo in contributed_repos:
+                repo_name = repo.get("nameWithOwner")
+                if (repo_name not in repos
+                        and repo_name not in self._exclude_repos):
+                    ignored_repos.add(repo_name)
 
         # TODO: Improve languages to scale by number of contributions to
         #       specific filetypes
-        langs_total = sum([v.get("size", 0) for v in self._languages.values()])
-        for k, v in self._languages.items():
-            v["prop"] = 100 * (v.get("size", 0) / langs_total)
+        languages_total = sum(
+            language["size"] for language in languages.values()
+        )
+        if languages_total > 0:
+            for language in languages.values():
+                language["prop"] = 100 * language["size"] / languages_total
+
+        self._name = owned_name or contributed_name
+        self._stargazers = stargazers
+        self._forks = forks
+        self._languages = languages
+        self._repos = repos
+        self._ignored_repos = ignored_repos
+
+    async def get_stats(self) -> None:
+        """Load repository statistics once and share the result across callers."""
+        if self._stats_task is None:
+            self._stats_task = asyncio.ensure_future(self._load_stats())
+        await asyncio.shield(self._stats_task)
 
     @property
     async def name(self) -> str:
@@ -469,8 +579,14 @@ Languages:
         additions = 0
         deletions = 0
         for repo in await self.all_repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
-            for author_obj in r:
+            result = await self.queries.query_rest(
+                f"/repos/{repo}/stats/contributors"
+            )
+            if not isinstance(result, list):
+                raise GitHubAPIError(
+                    "REST query returned malformed contributor statistics"
+                )
+            for author_obj in result:
                 # Handle malformed response from the API by skipping this repo
                 if (not isinstance(author_obj, dict)
                         or not isinstance(author_obj.get("author", {}), dict)):
@@ -497,8 +613,10 @@ Languages:
 
         total = 0
         for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
-            for view in r.get("views", []):
+            result = await self.queries.query_rest(
+                f"/repos/{repo}/traffic/views"
+            )
+            for view in result.get("views", []):
                 total += view.get("count", 0)
 
         self._views = total

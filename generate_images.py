@@ -116,6 +116,11 @@ async def main() -> None:
         s = Stats(user, access_token, session, exclude_repos=exclude_repos,
                   exclude_langs=exclude_langs,
                   consider_forked_repos=consider_forked_repos)
+        # Do not write either image until every required statistic is complete.
+        await s.get_stats()
+        await s.total_contributions
+        await s.lines_changed
+        await s.views
         await asyncio.gather(generate_languages(s), generate_overview(s))
 
 
